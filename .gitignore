@@ -1,0 +1,8 @@
+venv/
+data/
+__pycache__/
+*.pth
+NumPy.1.26.3_YasDL.com/
+wheels/
+*.rar
+*.whl
