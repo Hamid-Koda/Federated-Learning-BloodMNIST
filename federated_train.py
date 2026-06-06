@@ -5,6 +5,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 from medmnist import BloodMNIST
+import matplotlib.pyplot as plt  
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -29,7 +30,6 @@ datasets = random_split(dataset, lengths, generator=g)
 
 print(f"Total dataset size: {total_len}")
 print(f"Dataset sizes per client: {lengths}")
-# -------------------------------
 
 class BloodCNN(nn.Module):
     def __init__(self):
@@ -90,7 +90,7 @@ class FlowerClient(fl.client.NumPyClient):
     def evaluate(self, parameters, config):
         self.set_parameters(parameters)
         criterion = nn.CrossEntropyLoss()
-        self.model.eval() 
+        self.model.eval()
         loss = 0.0
         correct = 0
         with torch.no_grad():
@@ -103,7 +103,6 @@ class FlowerClient(fl.client.NumPyClient):
         accuracy = correct / len(self.loader.dataset)
         return float(loss / len(self.loader)), len(self.loader.dataset), {"accuracy": float(accuracy)}
 
-    
 def aggregate_metrics(metrics):
     accuracies = [m[1]["accuracy"] for m in metrics]
     examples = [m[0] for m in metrics]
@@ -118,11 +117,45 @@ def client_fn(cid):
     dataset = datasets[int(cid)]
     return FlowerClient(dataset)
 
-fl.simulation.start_simulation(
+results = fl.simulation.start_simulation(
     client_fn=client_fn,
     num_clients=NUM_CLIENTS,
-    config=fl.server.ServerConfig(num_rounds=5), 
+    config=fl.server.ServerConfig(num_rounds=5),
     strategy=strategy,
     ray_init_args={"object_store_memory": 100 * 1024 * 1024}
 )
 
+print("\n" + "="*30)
+print("Generating Federated Learning Plots...")
+print("="*30)
+
+try:
+    rounds_loss, losses = zip(*results.losses_distributed)
+    rounds_acc, accuracies = zip(*results.metrics_distributed["accuracy"])
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    ax1.plot(rounds_loss, losses, marker='o', color='crimson', linewidth=2, label='Distributed Loss')
+    ax1.set_title('Global Model Loss over Rounds', fontsize=12, fontweight='bold')
+    ax1.set_xlabel('Federated Rounds')
+    ax1.set_ylabel('Loss')
+    ax1.grid(True, linestyle='--', alpha=0.5)
+    ax1.legend()
+
+    ax2.plot(rounds_acc, [a * 100 for a in accuracies], marker='s', color='teal', linewidth=2, label='Distributed Accuracy')
+    ax2.set_title('Global Model Accuracy over Rounds', fontsize=12, fontweight='bold')
+    ax2.set_xlabel('Federated Rounds')
+    ax2.set_ylabel('Accuracy (%)')
+    ax2.grid(True, linestyle='--', alpha=0.5)
+    ax2.legend()
+
+    plt.tight_layout()
+    
+    plot_filename = "federated_metrics_plot.png"
+    plt.savefig(plot_filename, dpi=300)
+    print(f"✓ Success! Plot saved automatically as '{plot_filename}'")
+    
+    plt.show()
+
+except Exception as e:
+    print(f"⚠️ An error occurred while plotting: {e}")
