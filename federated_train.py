@@ -6,30 +6,52 @@ from torch.utils.data import DataLoader, random_split
 from torchvision import transforms
 from medmnist import BloodMNIST
 import matplotlib.pyplot as plt  
+import numpy as np
+
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+
 BATCH_SIZE = 64
-EPOCHS = 1 
+EPOCHS = 3
 NUM_CLIENTS = 3
+NUM_ROUNDS = 10
 
 transform = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize((0.5,), (0.5,))
 ])
 
+# --- Load Dataset ---
 dataset = BloodMNIST(split="train", transform=transform, download=True, root="./data")
 
+# --- Non-IID Dataset Partitioning ---
+# To simulate a non-IID scenario, we sort the dataset by its labels.
+# This ensures that each client receives a highly biased subset of blood cell classes.
 total_len = len(dataset)
-base_len = total_len // NUM_CLIENTS
-lengths = [base_len] * NUM_CLIENTS
-lengths[-1] += total_len - sum(lengths)
+labels = np.array([target[0] for _, target in dataset])
 
-g = torch.Generator().manual_seed(42)
-datasets = random_split(dataset, lengths, generator=g)
+# Get sorted indices based on class labels
+sorted_indices = np.argsort(labels)
+
+# Split the sorted indices into 3 chunks for the 3 clients
+base_len = total_len // NUM_CLIENTS
+indices_list = []
+
+for i in range(NUM_CLIENTS):
+    start_idx = i * base_len
+    # Ensure the last client gets any remaining data points
+    end_idx = (i + 1) * base_len if i < NUM_CLIENTS - 1 else total_len
+    indices_list.append(sorted_indices[start_idx:end_idx])
+
+# Create Subset datasets for each client based on non-IID indices
+datasets = [torch.utils.data.Subset(dataset, idx) for idx in indices_list]
 
 print(f"Total dataset size: {total_len}")
-print(f"Dataset sizes per client: {lengths}")
+print(f"Non-IID partitioning completed for {NUM_CLIENTS} clients.")
+for idx, cl_dataset in enumerate(datasets):
+    print(f" - Client {idx} data size: {len(cl_dataset)}")
+# ------------------------------------
 
 class BloodCNN(nn.Module):
     def __init__(self):
@@ -120,8 +142,9 @@ def client_fn(cid):
 results = fl.simulation.start_simulation(
     client_fn=client_fn,
     num_clients=NUM_CLIENTS,
-    config=fl.server.ServerConfig(num_rounds=5),
+    config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
     strategy=strategy,
+    client_resources={"num_cpus": 4},
     ray_init_args={"object_store_memory": 100 * 1024 * 1024}
 )
 
@@ -151,7 +174,7 @@ try:
 
     plt.tight_layout()
     
-    plot_filename = "federated_metrics_plot.png"
+    plot_filename = f"federated_metrics_NonIID_E{EPOCHS}_R{NUM_ROUNDS}.png"
     plt.savefig(plot_filename, dpi=300)
     print(f"✓ Success! Plot saved automatically as '{plot_filename}'")
     
