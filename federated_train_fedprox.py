@@ -2,111 +2,99 @@ import flwr as fl
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split
-from torchvision import transforms
+from torch.utils.data import DataLoader
+from torchvision import transforms, models
 from medmnist import BloodMNIST
-import matplotlib.pyplot as plt  
+import matplotlib.pyplot as plt
 import numpy as np
+import os
 
-
+# --- 1. Hyperparameters & Device Setup ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-BATCH_SIZE = 64
-EPOCHS = 3
+BATCH_SIZE = 32  
+EPOCHS = 2       
 NUM_CLIENTS = 3
-NUM_ROUNDS = 10
+NUM_ROUNDS = 30  
 
+# --- 2. Data Preparation ---
 transform = transforms.Compose([
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize((0.5,), (0.5,))
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
-# --- Load Dataset ---
+print("Downloading and preparing dataset...")
+os.makedirs("./data", exist_ok=True)
 dataset = BloodMNIST(split="train", transform=transform, download=True, root="./data")
 
-# --- Non-IID Dataset Partitioning ---
-# To simulate a non-IID scenario, we sort the dataset by its labels.
-# This ensures that each client receives a highly biased subset of blood cell classes.
+# --- Non-IID Partitioning (FULL DATASET) ---
 total_len = len(dataset)
 labels = np.array([target[0] for _, target in dataset])
-
-# Get sorted indices based on class labels
 sorted_indices = np.argsort(labels)
 
-# Split the sorted indices into 3 chunks for the 3 clients
 base_len = total_len // NUM_CLIENTS
 indices_list = []
-
 for i in range(NUM_CLIENTS):
     start_idx = i * base_len
-    # Ensure the last client gets any remaining data points
     end_idx = (i + 1) * base_len if i < NUM_CLIENTS - 1 else total_len
     indices_list.append(sorted_indices[start_idx:end_idx])
 
-# Create Subset datasets for each client based on non-IID indices
 datasets = [torch.utils.data.Subset(dataset, idx) for idx in indices_list]
+print(f"Non-IID partitioning completed for {NUM_CLIENTS} clients with FULL dataset ({total_len} images).")
 
-print(f"Total dataset size: {total_len}")
-print(f"Non-IID partitioning completed for {NUM_CLIENTS} clients.")
-for idx, cl_dataset in enumerate(datasets):
-    print(f" - Client {idx} data size: {len(cl_dataset)}")
-# ------------------------------------
-
-class BloodCNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.layer1 = nn.Sequential(
-            nn.Conv2d(3,16,3,padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        self.layer2 = nn.Sequential(
-            nn.Conv2d(16,32,3,padding=1),
-            nn.ReLU(),
-            nn.MaxPool2d(2)
-        )
-        self.fc = nn.Sequential(
-            nn.Linear(32*7*7,128),
-            nn.ReLU(),
-            nn.Linear(128,8)
-        )
-
-    def forward(self,x):
-        x=self.layer1(x)
-        x=self.layer2(x)
-        x=x.view(x.size(0),-1)
-        x=self.fc(x)
-        return x
-
-def train(model,loader):
+# --- 3. Federated Training Logic ---
+def train(model, loader, global_parameters, cid, mu=1.0):
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=0.001)
+    
+    params_dict = zip(model.state_dict().keys(), global_parameters)
+    global_state_dict = {k: torch.tensor(v).to(DEVICE) for k, v in params_dict}
+    
     model.train()
-    for images,labels in loader:
-        images,labels=images.to(DEVICE),labels.to(DEVICE).long().squeeze()
-        outputs=model(images)
-        loss=criterion(outputs,labels)
+    for batch_idx, (images, labels) in enumerate(loader):
+        images, labels = images.to(DEVICE), labels.to(DEVICE).long().squeeze()
+        outputs = model(images)
+        loss = criterion(outputs, labels)
+        
+        proximal_term = 0.0
+        for name, local_param in model.named_parameters():
+            if local_param.requires_grad:
+                global_param = global_state_dict[name]
+                proximal_term += torch.square((local_param - global_param).norm(2))
+        
+        loss += (mu / 2) * proximal_term
+        
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        
+        if batch_idx % 50 == 0:
+            print(f" [Heartbeat] Client {cid} - Batch {batch_idx}/{len(loader)} - Loss: {loss.item():.4f}")
 
+# --- 4. Flower Client Setup ---
 class FlowerClient(fl.client.NumPyClient):
-    def __init__(self, dataset):
-        self.model = BloodCNN().to(DEVICE)
-        self.loader = DataLoader(dataset,batch_size=BATCH_SIZE,shuffle=True)
+    def __init__(self, client_dataset, cid):
+        self.cid = cid
+        self.model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
+        for param in self.model.parameters():
+            param.requires_grad = False
+        self.model.fc = nn.Linear(self.model.fc.in_features, 8)
+        self.model = self.model.to(DEVICE)
+        self.loader = DataLoader(client_dataset, batch_size=BATCH_SIZE, shuffle=True)
 
     def get_parameters(self, config):
         return [val.cpu().numpy() for val in self.model.state_dict().values()]
 
     def set_parameters(self, parameters):
         params_dict = zip(self.model.state_dict().keys(), parameters)
-        state_dict = {k: torch.tensor(v) for k,v in params_dict}
+        state_dict = {k: torch.tensor(v) for k, v in params_dict}
         self.model.load_state_dict(state_dict, strict=True)
 
     def fit(self, parameters, config):
+        print(f"\n >>> Client {self.cid} starting local training on {DEVICE}...")
         self.set_parameters(parameters)
-        train(self.model,self.loader)
+        train(self.model, self.loader, parameters, cid=self.cid, mu=1.0)
+        print(f" <<< Client {self.cid} finished training.")
         return self.get_parameters(config={}), len(self.loader.dataset), {}
 
     def evaluate(self, parameters, config):
@@ -125,13 +113,13 @@ class FlowerClient(fl.client.NumPyClient):
         accuracy = correct / len(self.loader.dataset)
         return float(loss / len(self.loader)), len(self.loader.dataset), {"accuracy": float(accuracy)}
 
+# --- 5. Server Strategy & Simulation ---
 def aggregate_metrics(metrics):
     accuracies = [m[1]["accuracy"] for m in metrics]
     examples = [m[0] for m in metrics]
     weighted_avg = sum(a * e for a, e in zip(accuracies, examples)) / sum(examples)
     return {"accuracy": weighted_avg}
 
-# Using FedProx strategy to mitigate the Non-IID client drift
 strategy = fl.server.strategy.FedProx(
     fraction_fit=1.0,
     fraction_evaluate=1.0,
@@ -139,53 +127,45 @@ strategy = fl.server.strategy.FedProx(
     min_evaluate_clients=3,
     min_available_clients=3,
     evaluate_metrics_aggregation_fn=aggregate_metrics,
-    proximal_mu=1.0  # The magical proximal term (rubber band effect)
+    proximal_mu=1.0
 )
 
 def client_fn(cid):
-    dataset = datasets[int(cid)]
-    return FlowerClient(dataset)
+    return FlowerClient(datasets[int(cid)], cid)
+
+print("\n" + "="*40)
+print("Starting ResNet18 + FedProx Simulation on Google Colab")
+print("="*40)
 
 results = fl.simulation.start_simulation(
     client_fn=client_fn,
     num_clients=NUM_CLIENTS,
     config=fl.server.ServerConfig(num_rounds=NUM_ROUNDS),
     strategy=strategy,
-    client_resources={"num_cpus": 4},
-    ray_init_args={"object_store_memory": 100 * 1024 * 1024}
+    client_resources={"num_gpus": 1, "num_cpus": 2}, 
 )
 
-print("\n" + "="*30)
-print("Generating Federated Learning Plots...")
-print("="*30)
+# --- 6. Plotting Results ---
+rounds_loss, losses = zip(*results.losses_distributed)
+rounds_acc, accuracies = zip(*results.metrics_distributed["accuracy"])
 
-try:
-    rounds_loss, losses = zip(*results.losses_distributed)
-    rounds_acc, accuracies = zip(*results.metrics_distributed["accuracy"])
+fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+ax1.plot(rounds_loss, losses, marker='o', color='crimson', linewidth=2, label='Distributed Loss')
+ax1.set_title('ResNet18 FedProx Global Loss', fontsize=12, fontweight='bold')
+ax1.set_xlabel('Federated Rounds')
+ax1.set_ylabel('Loss')
+ax1.grid(True, linestyle='--', alpha=0.5)
+ax1.legend()
 
-    ax1.plot(rounds_loss, losses, marker='o', color='crimson', linewidth=2, label='Distributed Loss')
-    ax1.set_title('Global Model Loss over Rounds', fontsize=12, fontweight='bold')
-    ax1.set_xlabel('Federated Rounds')
-    ax1.set_ylabel('Loss')
-    ax1.grid(True, linestyle='--', alpha=0.5)
-    ax1.legend()
+ax2.plot(rounds_acc, [a * 100 for a in accuracies], marker='s', color='teal', linewidth=2, label='Distributed Accuracy')
+ax2.set_title('ResNet18 FedProx Global Accuracy', fontsize=12, fontweight='bold')
+ax2.set_xlabel('Federated Rounds')
+ax2.set_ylabel('Accuracy (%)')
+ax2.grid(True, linestyle='--', alpha=0.5)
+ax2.legend()
 
-    ax2.plot(rounds_acc, [a * 100 for a in accuracies], marker='s', color='teal', linewidth=2, label='Distributed Accuracy')
-    ax2.set_title('Global Model Accuracy over Rounds', fontsize=12, fontweight='bold')
-    ax2.set_xlabel('Federated Rounds')
-    ax2.set_ylabel('Accuracy (%)')
-    ax2.grid(True, linestyle='--', alpha=0.5)
-    ax2.legend()
-
-    plt.tight_layout()
-    
-    plot_filename = f"federated_metrics_FedProx_NonIID_E{EPOCHS}_R{NUM_ROUNDS}.png"
-    plt.savefig(plot_filename, dpi=300)
-    print(f"✓ Success! Plot saved automatically as '{plot_filename}'")
-    
-    plt.show()
-
-except Exception as e:
-    print(f"⚠️ An error occurred while plotting: {e}")
+plt.tight_layout()
+plt.savefig("federated_metrics_FedProx_ResNet18_Colab.png", dpi=300)
+print(f"\n✓ Success! Plot generated.")
+plt.show()
