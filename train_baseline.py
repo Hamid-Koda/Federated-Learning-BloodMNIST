@@ -5,14 +5,15 @@ from torch.utils.data import DataLoader
 from torchvision import transforms, models
 from medmnist import BloodMNIST
 import matplotlib.pyplot as plt
+import os
 
 # 1. Hyperparameters & Device Setup
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 BATCH_SIZE = 32  
-EPOCHS = 5
+EPOCHS = 50      
 LR = 0.001
 
-# 2. Data Pre-processing (Upgraded for ResNet18)
+# 2. Data Pre-processing
 train_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.RandomHorizontalFlip(),
@@ -28,43 +29,45 @@ test_transform = transforms.Compose([
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
 ])
 
+print("Downloading Datasets...")
+os.makedirs("./data", exist_ok=True)
 train_dataset = BloodMNIST(split='train', transform=train_transform, download=True, root='./data')
 test_dataset = BloodMNIST(split='test', transform=test_transform, download=True, root='./data')
 
 train_loader = DataLoader(dataset=train_dataset, batch_size=BATCH_SIZE, shuffle=True)
 test_loader = DataLoader(dataset=test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-# 3. Transfer Learning: ResNet18 Architecture
-print("Downloading and configuring pre-trained ResNet18...")
+# 3. Model Architecture 
+print("Configuring ResNet18 (Unfreezing Layer 4 & FC)...")
 model = models.resnet18(weights=models.ResNet18_Weights.IMAGENET1K_V1)
 
 for param in model.parameters():
     param.requires_grad = False
+
+for param in model.layer4.parameters():
+    param.requires_grad = True
 
 num_ftrs = model.fc.in_features
 model.fc = nn.Linear(num_ftrs, 8) 
 model = model.to(DEVICE)
 
 criterion = nn.CrossEntropyLoss()
-optimizer = optim.Adam(model.parameters(), lr=LR)
-
-history_loss = []
-history_acc = []
+optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=LR)
 
 # 4. Training Loop
-print(f"ResNet18 training started on {DEVICE}...")
+history_loss, history_acc = [], []
+print(f"Centralized Training started on {DEVICE}...")
+
 for epoch in range(EPOCHS):
     model.train()
     total_loss = 0
     for images, labels in train_loader:
         images, labels = images.to(DEVICE), labels.to(DEVICE).long().squeeze()
-        
         optimizer.zero_grad()
         outputs = model(images)
         loss = criterion(outputs, labels)
         loss.backward()
         optimizer.step()
-        
         total_loss += loss.item()
     
     epoch_loss = total_loss / len(train_loader)
@@ -72,8 +75,7 @@ for epoch in range(EPOCHS):
     
     # Evaluation
     model.eval()
-    correct = 0
-    total = 0
+    correct, total = 0, 0
     with torch.no_grad():
         for images, labels in test_loader:
             images, labels = images.to(DEVICE), labels.to(DEVICE).long().squeeze()
@@ -86,27 +88,6 @@ for epoch in range(EPOCHS):
     history_acc.append(epoch_acc)
     print(f"Epoch [{epoch+1}/{EPOCHS}] - Loss: {epoch_loss:.4f} - Test Accuracy: {epoch_acc*100:.2f}%")
 
-# 5. Save the ResNet18 model weights
-model_filename = 'resnet18_blood_model.pth'
-torch.save(model.state_dict(), model_filename)
-print(f"\n✓ ResNet18 weights successfully saved as '{model_filename}'")
-
-# 6. Plotting
-print("Generating ResNet18 Metrics Plots...")
-fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
-
-ax1.plot(range(1, EPOCHS + 1), history_loss, marker='o', color='darkred', linewidth=2)
-ax1.set_title('ResNet18 Training Loss')
-ax1.set_xlabel('Epochs')
-ax1.set_ylabel('Loss')
-ax1.grid(True, linestyle='--')
-
-ax2.plot(range(1, EPOCHS + 1), [a * 100 for a in history_acc], marker='s', color='forestgreen', linewidth=2)
-ax2.set_title('ResNet18 Testing Accuracy')
-ax2.set_xlabel('Epochs')
-ax2.set_ylabel('Accuracy (%)')
-ax2.grid(True, linestyle='--')
-
-plt.tight_layout()
-plt.savefig("centralized_resnet18_plot.png", dpi=300)
-print("✓ Plot saved as 'centralized_resnet18_plot.png'")
+# 5. Save the baseline model weights
+torch.save(model.state_dict(), 'resnet18_centralized.pth')
+print("\n✓ Baseline model saved as 'resnet18_centralized.pth'")

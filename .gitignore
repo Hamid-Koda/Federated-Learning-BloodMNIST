@@ -8,3 +8,4 @@ wheels/
 *.whl
 *.png
 *.txt
+*.csv
