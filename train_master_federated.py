@@ -12,7 +12,6 @@ import pandas as pd
 from typing import Dict, List, Tuple
 from collections import OrderedDict
 
-
 # --- 0. Set Seeds for Reproducibility ---
 torch.manual_seed(42)
 np.random.seed(42)
@@ -27,7 +26,7 @@ LOCAL_EPOCHS = 3
 BATCH_SIZE = 32
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-print(f"🚀 Running on Device: {DEVICE}")
+print(f" Running on Device: {DEVICE}")
 
 # --- 2. Data Preparation (with Updated Realistic Augmentation) ---
 train_transform = transforms.Compose([
@@ -71,7 +70,7 @@ def get_resnet18():
     model.fc = nn.Linear(model.fc.in_features, 8)
     return model.to(DEVICE)
 
-# --- 4. Client Definition (Unified for FedAvg & FedProx) ---
+# --- 4. Client Definition ---
 class BloodClient(fl.client.NumPyClient):
     def __init__(self, model, train_loader, mu):
         self.model = model
@@ -88,9 +87,7 @@ class BloodClient(fl.client.NumPyClient):
 
     def fit(self, parameters, config):
         self.set_parameters(parameters)
-        
         global_params = [p.clone().detach() for p in self.model.parameters()]
-
         criterion = nn.CrossEntropyLoss()
         optimizer = optim.Adam(filter(lambda p: p.requires_grad, self.model.parameters()), lr=0.001)
 
@@ -114,8 +111,10 @@ class BloodClient(fl.client.NumPyClient):
 
         return self.get_parameters(config=None), len(self.train_loader.dataset), {}
 
-# --- 5. Server Evaluation Function ---
-def get_evaluate_fn(global_model):
+# --- 5. Server Evaluation Function (with Best Checkpoint Logic) ---
+def get_evaluate_fn(global_model, experiment_name):
+    best_acc = {"val": 0.0}
+    
     def evaluate(server_round: int, parameters: fl.common.NDArrays, config: Dict[str, fl.common.Scalar]):
         params_dict = zip(global_model.state_dict().keys(), parameters)
         state_dict = OrderedDict({k: torch.tensor(v) for k, v in params_dict})
@@ -134,13 +133,21 @@ def get_evaluate_fn(global_model):
                 correct += (predicted == labels).sum().item()
 
         accuracy = correct / total
-        return loss / total, {"accuracy": accuracy}
+        epoch_loss = loss / total
+        
+        if accuracy > best_acc["val"]:
+            best_acc["val"] = accuracy
+            weight_filename = f"{experiment_name}_global_model.pth"
+            torch.save(global_model.state_dict(), weight_filename)
+            print(f"    Round {server_round}: New Best Model Saved! ({accuracy*100:.2f}%)")
+
+        return epoch_loss, {"accuracy": accuracy}
     return evaluate
 
 # --- 6. The Master Runner Function ---
 def run_experiment(experiment_name: str, mu_value: float):
     print(f"\n{'='*60}")
-    print(f"🔥 STARTING EXPERIMENT: {experiment_name} (mu = {mu_value})")
+    print(f" STARTING EXPERIMENT: {experiment_name} (mu = {mu_value})")
     print(f"{'='*60}\n")
 
     global_model = get_resnet18()
@@ -150,7 +157,7 @@ def run_experiment(experiment_name: str, mu_value: float):
         fraction_evaluate=0.0,
         min_fit_clients=NUM_CLIENTS,
         min_available_clients=NUM_CLIENTS,
-        evaluate_fn=get_evaluate_fn(global_model),
+        evaluate_fn=get_evaluate_fn(global_model, experiment_name),
     )
 
     def client_fn(cid: str):
@@ -172,16 +179,11 @@ def run_experiment(experiment_name: str, mu_value: float):
     df = pd.DataFrame({"Round": rounds, "Loss": losses, "Accuracy": accs})
     csv_filename = f"{experiment_name}_history.csv"
     df.to_csv(csv_filename, index=False)
-    print(f"\n✅ Training Logs saved to: {csv_filename}")
-
-    weight_filename = f"{experiment_name}_global_model.pth"
-    torch.save(global_model.state_dict(), weight_filename)
-    print(f"✅ Final Model Weights saved to: {weight_filename}\n")
+    print(f"\n Training Logs saved to: {csv_filename}")
+    print(f" The absolute best model was saved during rounds as: {experiment_name}_global_model.pth\n")
 
 # --- 7. EXECUTION ---
 if __name__ == "__main__":
     run_experiment("Ultimate_FedAvg", mu_value=0.0)
-
     run_experiment("Ultimate_FedProx_mu1.0", mu_value=1.0)
-    
     run_experiment("Ultimate_FedProx_mu0.1", mu_value=0.1)
